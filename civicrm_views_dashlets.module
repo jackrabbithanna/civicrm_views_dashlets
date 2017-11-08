@@ -1,0 +1,220 @@
+<?php
+
+/**
+ * @file
+ * Allows users to create a Civicrm dashlet with an embedded Drupal View.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function civicrm_views_dashlets_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#civicrm_views_dashlets':
+      return check_markup(file_get_contents(dirname(__FILE__) . "/README.txt"));
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function civicrm_views_dashlets_views_api() {
+  return array('api' => 3);
+}
+
+/**
+ * Fetches a list of all views dashlets; displays are grouped by view
+ *
+ * @throws \CiviCRM_API3_Exception
+ * @return array
+ */
+function _civicrm_views_dashlets_get() {
+  civicrm_initialize();
+  $results = array();
+  try {
+    $dashlets = civicrm_api3('Dashboard', 'get', array(
+      'name' => array('LIKE' => '%dashlet_view%'),
+      'options' => array('limit' => 0),
+    ));
+    foreach ($dashlets['values'] as $dashlet) {
+      list($view_name, $display_id) = explode('/', $dashlet['name']);
+      $results[$view_name][$display_id] = $dashlet;
+    }
+  } catch (CiviCRM_API3_Exception $e) {
+    watchdog('civicrm_views_dashlets', $e->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $results;
+}
+
+/**
+ * Implements hook_views_view_presave().
+ */
+function civicrm_views_dashlets_views_view_presave($view) {
+  foreach ($view->display as $display) {
+    if ($display->display_plugin == 'dashlet_view' && !empty($view->changed_display[$display->id])) {
+      _civicrm_views_dashlets_display_save_handle($view, $display);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_view_delete().
+ *
+ * Delete all associated CiviCRM dashlets.
+ */
+function civicrm_views_dashlets_views_view_delete($view) {
+  // Iterate through each display.
+  foreach ($view->display as $display) {
+    if ($display->display_plugin == 'dashlet_view' && !empty($display->display_options['id'])) {
+      _civicrm_views_dashlets_dashlet_event_handler(array('id' => $display->display_options['id']), 'delete');
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * A menu rebuild is a sign that views may have been enabled or disabled.
+ * Unfortunately this seems to be the only reliable hook for those events.
+ */
+function civicrm_views_dashlets_menu() {
+  $all_dashlets = _civicrm_views_dashlets_get();
+  if ($all_dashlets) {
+    $views = views_get_all_views();
+    foreach ($all_dashlets as $view_name => $dashlets) {
+      $view = NULL;
+      if (isset($views[$view_name])) {
+        $view = $views[$view_name];
+        $view->init_display();
+      }
+      foreach ($dashlets as $display_id => $dashlet) {
+        $display = $view && isset($view->display[$display_id]) ? $view->display[$display_id] : NULL;
+        // Skip if the display handler failed to load - might happen in cases where this module was just enabled
+        if (!$display || isset($display->handler)) {
+          $active = ($display && !$view->disabled && $display->handler->get_option('enabled'));
+          if ($dashlet['is_active'] != $active || !$display) {
+            _civicrm_views_dashlets_dashlet_event_handler(
+              array('id' => $dashlet['id'], 'is_active' => $active),
+              $display ? 'set_active' : 'delete'
+            );
+          }
+        }
+      }
+    }
+  }
+  return array();
+}
+
+/**
+ * Submit handler to set up dashlet manipulation on dashlet-display save.
+ */
+function _civicrm_views_dashlets_display_save_handle($view, $display) {
+  civicrm_initialize();
+
+  $id = isset($display->display_options['id']) ? $display->display_options['id'] : '';
+
+  // If display is set to be deleted, delete dashlet.
+  if (!empty($display->deleted) && $id) {
+    _civicrm_views_dashlets_dashlet_event_handler(array('id' => $id), 'delete');
+    return;
+  }
+
+  $cache_minutes = $display->handler->get_option('cache_minutes');
+
+  // Dashlet params.
+  $args = array(
+    'label' => $display->handler->get_option('title'),
+    'name' => $view->name . '/' . $display->id,
+    'url' => url($display->handler->get_option('path')),
+    'is_active' => (int) (!$view->disabled && $display->handler->get_option('enabled')),
+    'permission' => '',
+    'cache_minutes' => $cache_minutes ? $cache_minutes : 60,
+  );
+
+  $access = $display->handler->get_option('access');
+  if (!empty($access['perm']) && $access['type'] == 'perm') {
+    $args['permission'] = $access['perm'];
+  }
+
+  if (!strlen($args['label'])) {
+    $args['label'] = $display->handler->_default_title();
+    $display->handler->set_option('title', $args['label']);
+  }
+
+  // Check if the dashlet still exists.
+  if ($id && civicrm_api3('Dashboard', 'getcount', array('id' => $id))) {
+    $args['id'] = $id;
+  }
+
+  _civicrm_views_dashlets_dashlet_event_handler($args, 'create', $display);
+}
+
+/**
+ * Use the CiviCRM API to manipulate a dashlet.
+ */
+function _civicrm_views_dashlets_dashlet_event_handler($args, $action, $display = NULL) {
+  civicrm_initialize();
+
+  try {
+    switch ($action) {
+      // Save a dashlet.
+      case 'create':
+        $args['fullscreen_url'] = $args['url'];
+
+        // Create a dashlet.
+        $returnarray = civicrm_api3('Dashboard', 'create', $args);
+
+        // Set id field of display to the id returned from the create function.
+        if (!isset($args['id'])) {
+          $display->handler->set_option('id', $returnarray['id']);
+        }
+
+        break;
+
+      // Delete a dashlet.
+      case 'delete':
+        civicrm_api3('Dashboard', 'delete', array('id' => $args['id']));
+        break;
+
+      // Enable/disable a dashlet.
+      case 'set_active':
+        civicrm_api3('Dashboard', 'setvalue', array(
+          'id' => $args['id'],
+          'field' => 'is_active',
+          'value' => $args['is_active'],
+        ));
+        break;
+    }
+  } catch (CiviCRM_API3_Exception $e) {
+    watchdog('civicrm_views_dashlets', $e->getMessage(), array(), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Callback function for $items[$path] that creates the view passed.
+ */
+function _civicrm_views_dashlets_menu_callback($name, $display_id) {
+  // Create the view passed.
+  return views_embed_view($name, $display_id);
+}
+
+/**
+ * Delivery callback function for $items[$path] that renders the view passed.
+ */
+function _civicrm_views_dashlets_menu_delivery_callback($page_callback_result) {
+  // FIXME: We should only be adding css/js that is attached to the view. This is way overkill.
+  $html = $page_callback_result . drupal_get_css() . drupal_get_js();
+
+  if (isset($_GET['snippet']) && $_GET['snippet'] == 'json') {
+    drupal_json_output(array(
+      'content' => $html,
+      'status' => 'success',
+    ));
+  }
+  else {
+    print $html;
+  }
+
+  // Perform end-of-request tasks.
+  drupal_page_footer();
+}

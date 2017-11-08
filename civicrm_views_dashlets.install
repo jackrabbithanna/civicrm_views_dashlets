@@ -1,0 +1,90 @@
+<?php
+
+/**
+ * @file
+ * This file deletes all custom variables, displays, and dashlets.
+ */
+
+/**
+ * Implements hook_uninstall().
+ */
+function civicrm_views_dashlets_uninstall() {
+  // Delete all dashlets.
+  civicrm_initialize();
+  $dashlets = civicrm_api3('Dashboard', 'get', array(
+    'name' => array('LIKE' => '%dashlet_view%'),
+    'options' => array('limit' => 0),
+  ));
+  foreach ($dashlets['values'] as $dashlet) {
+    civicrm_api3('Dashboard', 'delete', array(
+      'id' => $dashlet['id'],
+    ));
+  }
+
+  // Delete all dashlet displays.
+  foreach (views_get_all_views() as $view) {
+    foreach ($view->display as $display) {
+      if ($display->display_plugin == 'dashlet_view') {
+        // Delete display.
+        $display_id = $display->id;
+        db_delete('views_display')->condition('id', '\'' . $display_id . '\'')->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_disable().
+ */
+function civicrm_views_dashlets_disable() {
+  civicrm_initialize();
+  $dashlets = civicrm_api3('Dashboard', 'get', array(
+    'name' => array('LIKE' => '%dashlet_view%'),
+    'is_active' => 1,
+    'options' => array('limit' => 0),
+  ));
+  foreach ($dashlets['values'] as $dashlet) {
+    civicrm_api3('Dashboard', 'setvalue', array(
+      'id' => $dashlet['id'],
+      'field' => 'is_active',
+      'value' => 0,
+    ));
+  }
+}
+
+/**
+ * Implements hook_enable().
+ *
+ * Views cache must be cleared while enabling this module so that
+ * our hook_menu() callback is able to load our display handler.
+ */
+function civicrm_views_dashlets_enable() {
+  cache_clear_all('*', 'cache_views', TRUE);
+  views_fetch_plugin_data(NULL, NULL, TRUE);
+}
+
+
+/**
+ * Change dashlet names to reflect view name instead of id
+ */
+function civicrm_views_dashlets_update_7000() {
+  $views = array();
+  foreach (views_get_all_views() as $name => $view) {
+    $views[$view->vid] = $name;
+  }
+  civicrm_initialize();
+  $dashlets = civicrm_api3('Dashboard', 'get', array(
+    'name' => array('LIKE' => '%dashlet_view%'),
+    'options' => array('limit' => 0),
+  ));
+  foreach ($dashlets['values'] as $dashlet) {
+    list($view_id, $display_id) = explode('-', $dashlet['name']);
+    if (isset($views[$view_id])) {
+      $dashlet['name'] = $views[$view_id] . '/' . $display_id;
+      civicrm_api3('Dashboard', 'create', $dashlet);
+    }
+    else {
+      civicrm_api3('Dashboard', 'delete', array('id' => $dashlet['id']));
+    }
+  }
+}
